@@ -1,0 +1,13 @@
+[DEFAULT]
+rq = 5
+rrn = 2
+clones = 3
+gmt = 100
+user = YourName
+
+[AZURE]
+# Get your API key from: https://portal.azure.com
+# Create a Speech Service resource and copy Key 1
+api_key = YOUR_AZURE_API_KEY_HERE
+# Common regions: westeurope, eastus, westus, southeastasia
+region = westeurope

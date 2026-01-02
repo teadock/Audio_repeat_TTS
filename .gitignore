@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE
+.vscode/
+.idea/
+
+# Configuration (contains API keys)
+config.ini
+
+# Audio files
+*.wav
+*.mp3
+
+# User recordings and generated folders
+recording.wav
+Test/
+Test*/
+*/Recordings*/
+sounds/
+
+# OS
+.DS_Store
+Thumbs.db
