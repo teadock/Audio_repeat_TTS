@@ -72,6 +72,11 @@ class App:
 
         self.config.read(self.config_path)
 
+        # Cache for voices - load once at startup
+        self.voices_cache = None
+        self.voices_by_lang_cache = None
+        self.voices_loaded = False
+
         self.audio_files = []  # Audio files that are to be played
         self.rounds = []  # A list of rounds where each round is a list of audio files
         self.current_round = []  # The current round of audio files being played
@@ -194,6 +199,35 @@ class App:
             if show_subs.lower() == 'true':
                 self.show_subtitles.set(True)
                 self.toggle_subtitles()  # Show the subtitle field
+        
+        # Load voices in background at startup
+        self.load_voices_at_startup()
+
+    def load_voices_at_startup(self):
+        """Load voices once at startup in background"""
+        def load_voices():
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            tts_module_path = os.path.join(script_dir, 'tts_module')
+            sys.path.insert(0, tts_module_path)
+            
+            try:
+                from azure_tts_module import get_available_voices
+                voices = get_available_voices()
+                
+                if voices:
+                    self.voices_cache = voices
+                    self.voices_by_lang_cache = self.organize_voices_by_language(voices)
+                    self.voices_loaded = True
+                    print(f"✓ Loaded {len(voices)} voices at startup")
+                else:
+                    print("⚠ Failed to load voices. Check API key and internet connection.")
+                    
+            except Exception as e:
+                print(f"⚠ Error loading voices at startup: {e}")
+        
+        # Run in background thread
+        import threading
+        threading.Thread(target=load_voices, daemon=True).start()
 
     def start_and_save(self):
         self.save_config()
@@ -763,26 +797,13 @@ Need more help? Click the "Documentation" button below."""
         )
         close_button.pack(side='left', padx=5)
         
-        # Load voices in background
+        # Load voices from cache or show loading message
         def load_voices():
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            tts_module_path = os.path.join(script_dir, 'tts_module')
-            sys.path.insert(0, tts_module_path)
-            
-            try:
-                from azure_tts_module import get_available_voices
-                voices = get_available_voices()
-                
-                if not voices:
-                    status_label.config(text="Failed to load voices. Check API key.", fg="red")
-                    return
-                
-                # Organize voices by language with priorities
-                voices_by_lang = self.organize_voices_by_language(voices)
-                
-                # Populate language dropdown
-                languages = list(voices_by_lang.keys())
-                language_combo['values'] = languages
+            # Check if voices are already cached
+            if self.voices_loaded and self.voices_cache and self.voices_by_lang_cache:
+                # Use cached voices
+                voices = self.voices_cache
+                voices_by_lang = self.voices_by_lang_cache
                 
                 # Get current voice from config
                 current_voice = 'en-US-BrianNeural'
@@ -796,58 +817,90 @@ Need more help? Click the "Documentation" button below."""
                         current_lang = lang
                         break
                 
-                if current_lang:
-                    language_var.set(current_lang)
-                elif languages:
-                    language_var.set(languages[0])
-                
-                # Update voice list when language changes
-                def on_language_change(event):
-                    selected_lang = language_var.get()
-                    voice_list = voices_by_lang.get(selected_lang, [])
-                    voice_names = [f"{v['name']} ({v['gender']}) {'[Neural]' if v['voice_type'] == 'Neural' else ''}" 
-                                   for v in voice_list]
-                    voice_combo['values'] = voice_names
-                    if voice_names:
-                        voice_combo.current(0)
-                        update_voice_info()
-                
-                def update_voice_info():
-                    selected_display = voice_var.get()
-                    if selected_display:
-                        voice_name = selected_display.split(' (')[0]
+                # Update UI in the main thread
+                def update_ui():
+                    # Populate language dropdown
+                    languages = list(voices_by_lang.keys())
+                    language_combo['values'] = languages
+                    
+                    if current_lang:
+                        language_var.set(current_lang)
+                    elif languages:
+                        language_var.set(languages[0])
+                    
+                    # Update voice list when language changes
+                    def on_language_change(event):
                         selected_lang = language_var.get()
                         voice_list = voices_by_lang.get(selected_lang, [])
-                        voice_data = next((v for v in voice_list if v['name'] == voice_name), None)
-                        if voice_data:
-                            info_label.config(
-                                text=f"Voice: {voice_data['name']}\nLocale: {voice_data['locale']}\n"
-                                     f"Gender: {voice_data['gender']}\nType: {voice_data['voice_type']}"
-                            )
-                
-                language_combo.bind('<<ComboboxSelected>>', on_language_change)
-                voice_combo.bind('<<ComboboxSelected>>', lambda e: update_voice_info())
-                
-                # Trigger initial load
-                on_language_change(None)
-                
-                # Select current voice if found
-                if current_lang:
-                    voice_list = voices_by_lang.get(current_lang, [])
-                    for idx, v in enumerate(voice_list):
-                        if v['name'] == current_voice:
-                            voice_combo.current(idx)
+                        voice_names = [f"{v['name']} ({v['gender']}) {'[Neural]' if v['voice_type'] == 'Neural' else ''}" 
+                                       for v in voice_list]
+                        voice_combo['values'] = voice_names
+                        if voice_names:
+                            voice_combo.current(0)
                             update_voice_info()
-                            break
+                    
+                    def update_voice_info():
+                        selected_display = voice_var.get()
+                        if selected_display:
+                            voice_name = selected_display.split(' (')[0]
+                            selected_lang = language_var.get()
+                            voice_list = voices_by_lang.get(selected_lang, [])
+                            voice_data = next((v for v in voice_list if v['name'] == voice_name), None)
+                            if voice_data:
+                                info_label.config(
+                                    text=f"Voice: {voice_data['name']}\nLocale: {voice_data['locale']}\n"
+                                         f"Gender: {voice_data['gender']}\nType: {voice_data['voice_type']}"
+                                )
+                    
+                    language_combo.bind('<<ComboboxSelected>>', on_language_change)
+                    voice_combo.bind('<<ComboboxSelected>>', lambda e: update_voice_info())
+                    
+                    # Trigger initial load
+                    on_language_change(None)
+                    
+                    # Select current voice if found
+                    if current_lang:
+                        voice_list = voices_by_lang.get(current_lang, [])
+                        for idx, v in enumerate(voice_list):
+                            if v['name'] == current_voice:
+                                voice_combo.current(idx)
+                                update_voice_info()
+                                break
+                    
+                    status_label.config(text=f"Ready - {len(voices)} voices available", fg="green")
                 
-                status_label.config(text=f"Loaded {len(voices)} voices", fg="green")
+                # Update UI immediately (already on main thread)
+                update_ui()
                 
-            except Exception as e:
-                status_label.config(text=f"Error: {e}", fg="red")
+            else:
+                # Voices not loaded yet - try loading them now
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                tts_module_path = os.path.join(script_dir, 'tts_module')
+                sys.path.insert(0, tts_module_path)
+                
+                status_label.config(text="Loading voices...", fg="orange")
+                
+                try:
+                    from azure_tts_module import get_available_voices
+                    voices = get_available_voices()
+                    
+                    if not voices:
+                        settings_window.after(0, lambda: status_label.config(text="Failed to load voices. Check API key.", fg="red"))
+                        return
+                    
+                    # Cache the voices
+                    self.voices_cache = voices
+                    self.voices_by_lang_cache = self.organize_voices_by_language(voices)
+                    self.voices_loaded = True
+                    
+                    # Recursively call load_voices to use the cached data
+                    settings_window.after(0, load_voices)
+                    
+                except Exception as e:
+                    settings_window.after(0, lambda err=str(e): status_label.config(text=f"Error: {err}", fg="red"))
         
-        # Run in thread to avoid blocking UI
-        import threading
-        threading.Thread(target=load_voices, daemon=True).start()
+        # Call load_voices
+        load_voices()
     
     def organize_voices_by_language(self, voices):
         """Organize voices by language with neural voices first and common variants prioritized"""
@@ -987,6 +1040,9 @@ Need more help? Click the "Documentation" button below."""
             
             with open(self.config_path, 'w') as configfile:
                 self.config.write(configfile)
+            
+            # Reload config to ensure it's in sync
+            self.config.read(self.config_path)
             
             messagebox.showinfo("Success", f"Voice '{voice_name}' saved as default!")
             window.destroy()

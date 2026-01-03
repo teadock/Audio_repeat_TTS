@@ -33,6 +33,7 @@ def get_available_voices():
     """Fetch available voices from Azure Speech Service"""
     SUBSCRIPTION_KEY, REGION, _ = get_azure_config()
     if not SUBSCRIPTION_KEY or not REGION:
+        print("Azure API key or region not configured")
         return []
     
     try:
@@ -51,6 +52,12 @@ def get_available_voices():
                     'voice_type': voice.voice_type.name
                 })
             return voices
+        elif result.reason == speechsdk.ResultReason.Canceled:
+            cancellation = result.cancellation_details
+            print(f"Failed to retrieve voices: {cancellation.reason}")
+            if cancellation.reason == speechsdk.CancellationReason.Error:
+                print(f"Error details: {cancellation.error_details}")
+            return []
         else:
             print(f"Failed to retrieve voices: {result.reason}")
             return []
