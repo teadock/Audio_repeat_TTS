@@ -21,7 +21,9 @@ recording.wav
 Test/
 Test*/
 */Recordings*/
+Recordings/
 sounds/
+_temp_speed/
 
 # OS
 .DS_Store

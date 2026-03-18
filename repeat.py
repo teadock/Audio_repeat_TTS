@@ -10,6 +10,7 @@ def check_and_install_dependencies():
         'pyaudio': 'pyaudio',
         'scipy': 'scipy',
         'pydub': 'pydub',
+        'numpy': 'numpy',
         'azure.cognitiveservices.speech': 'azure-cognitiveservices-speech'
     }
     
@@ -35,7 +36,9 @@ def check_and_install_dependencies():
         
         print("All required packages have been installed. Restarting application...")
         # Restart the script to load newly installed modules
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        # Use subprocess instead of os.execv – handles paths with spaces on Windows
+        subprocess.Popen([sys.executable] + sys.argv)
+        sys.exit(0)
 
 # Run dependency check before importing other modules
 check_and_install_dependencies()
@@ -59,7 +62,7 @@ class App:
         pygame.mixer.init()
 
         self.root = root
-        root.geometry("273x480")  # Increased height for mic volume slider
+        root.geometry("273x520")  # Increased height for mic volume and speed sliders
         
         # Dictionary to store phrase mappings
         self.phrases_dict = {}
@@ -76,6 +79,10 @@ class App:
         self.voices_cache = None
         self.voices_by_lang_cache = None
         self.voices_loaded = False
+        
+        # Recording session folder - created when starting playback
+        self.recording_session_folder = None
+        self.recording_counter = 0
 
         self.audio_files = []  # Audio files that are to be played
         self.rounds = []  # A list of rounds where each round is a list of audio files
@@ -147,6 +154,35 @@ class App:
         self.mic_volume_value_label = tk.Label(self.mic_volume_frame, text="100%", font=("Arial", 9), width=5)
         self.mic_volume_value_label.pack(side=tk.LEFT, padx=5)
 
+        # Playback speed control (pitch-preserving)
+        self.playback_speed_frame = tk.Frame(root)
+        self.playback_speed_frame.pack(pady=5)
+        
+        self.playback_speed_label = tk.Label(self.playback_speed_frame, text="Speed:", font=("Arial", 9))
+        self.playback_speed_label.pack(side=tk.LEFT, padx=5)
+        
+        # Speed slider (50-150%, default 100%)
+        self.playback_speed = tk.DoubleVar(value=100.0)
+        self.playback_speed_slider = tk.Scale(
+            self.playback_speed_frame,
+            from_=50,
+            to=150,
+            orient=tk.HORIZONTAL,
+            variable=self.playback_speed,
+            command=self.on_playback_speed_change,
+            length=150,
+            showvalue=0,
+            resolution=5
+        )
+        self.playback_speed_slider.pack(side=tk.LEFT)
+        
+        self.playback_speed_value_label = tk.Label(self.playback_speed_frame, text="100%", font=("Arial", 9), width=5)
+        self.playback_speed_value_label.pack(side=tk.LEFT, padx=5)
+        
+        # Cache for time-stretched files to avoid re-processing
+        self._speed_cache = {}
+        self._current_speed_file = None
+
         # Start, Stop, Load, and Export buttons       
         self.load_button = tk.Button(root, text='Load', command=self.load)
         self.load_button.pack(pady=(10, 10))  # Add some space above the button
@@ -193,6 +229,18 @@ class App:
             except:
                 self.mic_volume.set(100.0)
                 self.mic_volume_value_label.config(text="100%")
+            
+            # Load playback speed setting
+            pb_speed = default_config.get('playback_speed', '100')
+            try:
+                speed_value = float(pb_speed)
+                # Clamp to slider range
+                speed_value = max(50, min(150, speed_value))
+                self.playback_speed.set(speed_value)
+                self.playback_speed_value_label.config(text=f"{int(speed_value)}%")
+            except:
+                self.playback_speed.set(100.0)
+                self.playback_speed_value_label.config(text="100%")
             
             # Load subtitle checkbox state
             show_subs = default_config.get('show_subtitles', 'False')
@@ -258,16 +306,212 @@ class App:
         with open(self.config_path, 'w') as configfile:
             self.config.write(configfile)
     
+    def get_speed_adjusted_file(self, original_file):
+        """Get a time-stretched version of the file if speed != 100%, preserving pitch.
+        Uses phase vocoder approach via scipy for pitch-preserving time stretch.
+        Uses a cache to avoid re-processing the same file at the same speed."""
+        speed = self.playback_speed.get() / 100.0  # Convert percentage to factor
+        
+        # If speed is 100%, just return the original file
+        if abs(speed - 1.0) < 0.01:
+            return original_file
+        
+        # Check cache
+        cache_key = (original_file, speed)
+        if cache_key in self._speed_cache and os.path.exists(self._speed_cache[cache_key]):
+            return self._speed_cache[cache_key]
+        
+        try:
+            import numpy as np
+            
+            # Load audio using pydub
+            audio = AudioSegment.from_file(original_file)
+            sample_rate = audio.frame_rate
+            channels = audio.channels
+            sample_width = audio.sample_width
+            
+            # Convert to numpy array
+            samples = np.array(audio.get_array_of_samples(), dtype=np.float64)
+            
+            # Handle stereo by reshaping
+            if channels > 1:
+                samples = samples.reshape(-1, channels)
+            
+            # Phase vocoder time-stretch (preserves pitch)
+            stretched = self._phase_vocoder_stretch(samples, speed, channels)
+            
+            # Convert back to int16
+            stretched = np.clip(stretched, -32768, 32767).astype(np.int16)
+            
+            # Create AudioSegment from stretched audio
+            if channels > 1:
+                stretched = stretched.flatten()
+            
+            stretched_audio = AudioSegment(
+                data=stretched.tobytes(),
+                sample_width=sample_width,
+                frame_rate=sample_rate,
+                channels=channels
+            )
+            
+            # Save to a temp file
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            temp_dir = os.path.join(script_dir, '_temp_speed')
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            # Create a unique filename based on original name and speed
+            base_name = os.path.splitext(os.path.basename(original_file))[0]
+            speed_str = f"{int(speed * 100)}"
+            temp_file = os.path.join(temp_dir, f"{base_name}_speed{speed_str}.wav")
+            
+            stretched_audio.export(temp_file, format='wav')
+            
+            # Cache the result
+            self._speed_cache[cache_key] = temp_file
+            
+            return temp_file
+            
+        except Exception as e:
+            print(f"Error adjusting playback speed: {e}")
+            return original_file
+    
+    def _phase_vocoder_stretch(self, samples, speed, channels):
+        """Time-stretch audio using phase vocoder (preserves pitch).
+        Uses STFT-based approach with scipy."""
+        import numpy as np
+        
+        def stretch_channel(mono_samples, rate):
+            """Stretch a single channel of audio"""
+            n_fft = 2048
+            hop_length = n_fft // 4
+            
+            # STFT
+            # Compute the Short-Time Fourier Transform
+            n_frames = 1 + (len(mono_samples) - n_fft) // hop_length
+            if n_frames <= 0:
+                return mono_samples
+            
+            # Window
+            window = np.hanning(n_fft)
+            
+            # Forward STFT
+            stft = np.zeros((n_fft // 2 + 1, n_frames), dtype=np.complex128)
+            for i in range(n_frames):
+                start = i * hop_length
+                frame = mono_samples[start:start + n_fft] * window
+                spectrum = np.fft.rfft(frame)
+                stft[:, i] = spectrum
+            
+            # Phase vocoder: interpolate frames
+            new_hop = int(hop_length / rate)
+            n_new_frames = int(n_frames / rate)
+            
+            phase_acc = np.angle(stft[:, 0])
+            previous_phase = np.angle(stft[:, 0])
+            
+            output_frames = []
+            
+            # Expected phase advance per hop
+            freq_bins = np.arange(n_fft // 2 + 1)
+            expected_phase_advance = 2.0 * np.pi * freq_bins * hop_length / n_fft
+            
+            for i in range(n_new_frames):
+                # Find the two source frames to interpolate between
+                src_pos = i * rate
+                src_idx = int(src_pos)
+                frac = src_pos - src_idx
+                
+                if src_idx + 1 >= n_frames:
+                    break
+                
+                # Interpolate magnitudes
+                mag = (1 - frac) * np.abs(stft[:, src_idx]) + frac * np.abs(stft[:, src_idx + 1])
+                
+                # Phase advance
+                current_phase = np.angle(stft[:, src_idx + 1])
+                phase_diff = current_phase - previous_phase - expected_phase_advance
+                
+                # Wrap phase difference to [-pi, pi]
+                phase_diff = phase_diff - 2.0 * np.pi * np.round(phase_diff / (2.0 * np.pi))
+                
+                # Accumulate phase
+                phase_acc += expected_phase_advance + phase_diff
+                previous_phase = current_phase
+                
+                # Reconstruct frame
+                frame_spectrum = mag * np.exp(1j * phase_acc)
+                frame = np.fft.irfft(frame_spectrum)
+                frame = frame[:n_fft] * window
+                output_frames.append(frame)
+            
+            # Overlap-add synthesis
+            output_length = (len(output_frames) - 1) * new_hop + n_fft
+            output = np.zeros(output_length)
+            
+            for i, frame in enumerate(output_frames):
+                start = i * new_hop
+                end = start + n_fft
+                if end <= output_length:
+                    output[start:end] += frame
+            
+            # Normalize
+            max_val = np.max(np.abs(output))
+            if max_val > 0:
+                original_max = np.max(np.abs(mono_samples))
+                output = output * (original_max / max_val)
+            
+            return output
+        
+        if channels > 1:
+            # Process each channel separately
+            result_channels = []
+            for ch in range(channels):
+                channel_data = samples[:, ch]
+                stretched = stretch_channel(channel_data, speed)
+                result_channels.append(stretched)
+            
+            # Make all channels the same length
+            min_len = min(len(ch) for ch in result_channels)
+            result = np.column_stack([ch[:min_len] for ch in result_channels])
+        else:
+            result = stretch_channel(samples, speed)
+        
+        return result
+    
+    def on_playback_speed_change(self, value):
+        """Called when playback speed slider changes"""
+        speed_val = int(float(value))
+        self.playback_speed_value_label.config(text=f"{speed_val}%")
+        
+        # Save to config
+        if 'DEFAULT' not in self.config:
+            self.config['DEFAULT'] = {}
+        self.config['DEFAULT']['playback_speed'] = str(float(value))
+        with open(self.config_path, 'w') as configfile:
+            self.config.write(configfile)
+        
+        # If currently playing source material, reload with new speed
+        if self.playing and self.mode == "Play" and self.current_file and pygame.mixer.music.get_busy():
+            try:
+                speed_file = self.get_speed_adjusted_file(self.current_file)
+                self._current_speed_file = speed_file
+                pygame.mixer.music.stop()
+                pygame.mixer.music.unload()
+                pygame.mixer.music.load(speed_file)
+                pygame.mixer.music.play()
+            except Exception as e:
+                print(f"Error changing speed during playback: {e}")
+    
     def toggle_subtitles(self):
         """Show or hide the subtitle text field"""
         if self.show_subtitles.get():
             self.subtitle_text.pack(pady=5, before=self.load_button)
             # Update window height to accommodate subtitles
-            self.root.geometry("273x550")
+            self.root.geometry("273x590")
         else:
             self.subtitle_text.pack_forget()
             # Restore original window height
-            self.root.geometry("273x480")
+            self.root.geometry("273x520")
         
         # Save the subtitle checkbox state
         if 'DEFAULT' not in self.config:
@@ -355,17 +599,38 @@ class App:
             round = self.audio_files[i:i + RQ*Clones]
             self.rounds.extend([round] * RRN)
 
+        # Clear speed cache when loading new files
+        self._speed_cache = {}
+
         # Load the first audio file to be played
         if self.rounds:
             self.current_round = self.rounds[0][:]
-            pygame.mixer.music.load(self.current_round[0])
             self.current_file = self.current_round[0]
+            speed_file = self.get_speed_adjusted_file(self.current_file)
+            self._current_speed_file = speed_file
+            pygame.mixer.music.load(speed_file)
             self.current_round = self.current_round[1:]
 
     def start(self):
         self.save_config()  # Add this line to save the configuration every time the start button is pressed
+        
+        # Create a new recording session folder with timestamp
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.recording_session_folder = os.path.join(script_dir, 'Recordings', f"session_{timestamp}")
+        os.makedirs(self.recording_session_folder, exist_ok=True)
+        self.recording_counter = 0
+        print(f"Recording session folder created: {self.recording_session_folder}")
+        
         self.playing = True
         self.mode = "Play"
+
+        # Re-load the music file (it was unloaded by stop())
+        if self.current_file:
+            speed_file = self.get_speed_adjusted_file(self.current_file)
+            self._current_speed_file = speed_file
+            pygame.mixer.music.load(speed_file)
+
         # Update subtitle for the first file
         if self.current_file:
             self.update_subtitle(self.current_file)
@@ -375,9 +640,11 @@ class App:
 
     def stop(self):
         self.playing = False
+        self.mode = "Play"  # Reset mode
         pygame.mixer.music.stop()
         # Unload any music to release file handles
         pygame.mixer.music.unload()
+        print("Playback stopped")
 
     def record_and_play(self):
         # Unload any currently loaded music to release the recording.wav file
@@ -385,7 +652,11 @@ class App:
         
         p = pyaudio.PyAudio()
         
-        freq = 22050  # Sample rate
+        # High quality recording settings
+        freq = 44100  # CD-quality sample rate (increased from 22050)
+        channels = 1  # Mono recording
+        sample_width = 2  # 16-bit audio
+        
         duration = pygame.mixer.Sound(self.current_file).get_length()  # Duration of recording
 
         try:
@@ -395,29 +666,66 @@ class App:
             gmt = 100 + gmt_value
         except ValueError:
             print("Invalid input for 'Give me more time'")
+            p.terminate()
             return
 
         duration *= gmt / 100
 
         frames = []  # Initialize array to store frames
 
-        # Start Recording
-        stream = p.open(format=p.get_format_from_width(2), channels=1, rate=freq, input=True,
+        # Start Recording with high quality settings
+        stream = p.open(format=p.get_format_from_width(sample_width), 
+                        channels=channels, 
+                        rate=freq, 
+                        input=True,
                         frames_per_buffer=int(freq / 5))  # Here we record in chunks of 1/5 of a second
 
-        for _ in range(int(duration * 5)):  # The 5 is because we're recording in chunks of 1/5 of a second
-            data = stream.read(int(freq / 5))
-            frames.append(data)
+        # Record in chunks while checking if we should stop
+        total_chunks = int(duration * 5)
+        for i in range(total_chunks):
+            # Check if user stopped playback
+            if not self.playing:
+                print("Recording stopped by user")
+                break
+            
+            # Process UI events to keep app responsive
+            self.root.update()
+            
+            try:
+                data = stream.read(int(freq / 5), exception_on_overflow=False)
+                frames.append(data)
+            except Exception as e:
+                print(f"Error reading audio: {e}")
+                break
 
         # Stop Recording
         stream.stop_stream()
         stream.close()
         p.terminate()
+        
+        # If stopped early, don't save
+        if not self.playing:
+            return
+        
+        # Generate timestamp for this recording
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # Include milliseconds
+        self.recording_counter += 1
+        
+        # Create filenames with session folder
+        if self.recording_session_folder:
+            recording_filename = os.path.join(self.recording_session_folder, 
+                                             f"recording_{self.recording_counter:03d}_{timestamp}.wav")
+            temp_raw_filename = os.path.join(self.recording_session_folder, 
+                                            f"_temp_raw_{timestamp}.wav")
+        else:
+            # Fallback if no session folder (shouldn't happen)
+            recording_filename = f'recording_{timestamp}.wav'
+            temp_raw_filename = f'recording_raw_{timestamp}.wav'
 
         # Save the raw recording first
-        wf = wave.open('recording_raw.wav', 'wb')
-        wf.setnchannels(1)
-        wf.setsampwidth(2)  # Set sample width directly to 2 (bytes)
+        wf = wave.open(temp_raw_filename, 'wb')
+        wf.setnchannels(channels)
+        wf.setsampwidth(sample_width)
         wf.setframerate(freq)
         wf.writeframes(b''.join(frames))
         wf.close()
@@ -430,7 +738,7 @@ class App:
             mic_volume_percent = self.mic_volume.get()
             
             # Load the raw recording
-            audio = AudioSegment.from_wav('recording_raw.wav')
+            audio = AudioSegment.from_wav(temp_raw_filename)
             
             # Calculate dB change
             # 100% = 0dB (no change), 200% = +6dB (double), 50% = -6dB (half)
@@ -441,27 +749,41 @@ class App:
                 # If 0%, make it silent
                 audio = audio - 100
             
-            # Export the adjusted recording
-            audio.export('recording.wav', format='wav')
+            # Export the adjusted recording with high quality
+            audio.export(recording_filename, format='wav', parameters=["-ar", str(freq), "-ac", str(channels)])
             
-            # Clean up raw file
-            import os
-            if os.path.exists('recording_raw.wav'):
-                os.remove('recording_raw.wav')
+            # Clean up temp raw file
+            if os.path.exists(temp_raw_filename):
+                os.remove(temp_raw_filename)
+            
+            print(f"Saved recording: {recording_filename}")
                 
         except Exception as e:
             print(f"Error adjusting volume: {e}")
             # If volume adjustment fails, just rename the raw file
-            import shutil
-            shutil.move('recording_raw.wav', 'recording.wav')
+            shutil.move(temp_raw_filename, recording_filename)
+            print(f"Saved recording (no volume adjustment): {recording_filename}")
+        
+        # Also save a copy as 'recording.wav' for playback (for backward compatibility)
+        playback_temp_file = 'recording.wav'
+        shutil.copy2(recording_filename, playback_temp_file)
 
     def check_music(self):
+        # Only process if still playing
+        if not self.playing:
+            return
+            
         if not pygame.mixer.music.get_busy() and self.playing:
             if self.mode == "Play":
                 pygame.mixer.music.set_volume(1.0)  # Set volume to 100%
                 # Update subtitle for the current file being played
                 self.update_subtitle(self.current_file)
                 self.record_and_play()
+                
+                # Check if still playing after recording (user might have stopped during recording)
+                if not self.playing:
+                    return
+                    
                 self.mode = "Record"
                 pygame.mixer.music.load('recording.wav')
                 # Volume is already adjusted in the audio file, so play at full volume
@@ -473,9 +795,11 @@ class App:
                 # Unload recording.wav before loading next file
                 pygame.mixer.music.unload()
                 if self.current_round:
-                    pygame.mixer.music.load(self.current_round[0])
                     self.current_file = self.current_round[0]
                     self.current_round = self.current_round[1:]
+                    speed_file = self.get_speed_adjusted_file(self.current_file)
+                    self._current_speed_file = speed_file
+                    pygame.mixer.music.load(speed_file)
                     pygame.mixer.music.play()
                     # Update subtitle for the new file
                     self.update_subtitle(self.current_file)
@@ -483,9 +807,11 @@ class App:
                     self.rounds = self.rounds[1:]
                     if self.rounds:
                         self.current_round = self.rounds[0][:]
-                        pygame.mixer.music.load(self.current_round[0])
                         self.current_file = self.current_round[0]
                         self.current_round = self.current_round[1:]
+                        speed_file = self.get_speed_adjusted_file(self.current_file)
+                        self._current_speed_file = speed_file
+                        pygame.mixer.music.load(speed_file)
                         pygame.mixer.music.play()
                         # Update subtitle for the new file
                         self.update_subtitle(self.current_file)
