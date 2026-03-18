@@ -1,0 +1,16 @@
+# Audio/Video files
+*.wav
+*.mp4
+*.avi
+*.mp3
+
+# Recordings folder
+Recordings/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# VS Code
+.vscode/
